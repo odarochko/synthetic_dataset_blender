@@ -284,26 +284,29 @@ CUDA_VISIBLE_DEVICES= python3 predict.py --ckpt <best.ckpt> \
 ## Compute cost (CPU)
 
 Per-frame cost of the three measurement methods on the 19 real `cam_000CDF0AD90F` frames, **CPU only**
-(`CUDA_VISIBLE_DEVICES=""`), Intel i7-13700H (20 logical CPUs), PyTorch 14 threads, 1 warm-up pass + 2 timed
-passes. *Ours* = `v567-13` in the `--tta --snap 15` config that produced the accuracy in `results.md`
-(`tools/eval_real.py`); *production* = `com.dachser.ilo.volume_measurement` (`tools/run_production.py`).
+(`CUDA_VISIBLE_DEVICES=""`), Intel i7-13700H (20 logical CPUs), 1 warm-up pass + 2 timed passes. *Ours* =
+`v567-13` in the `--tta --snap 15` config that produced the accuracy in `results.md` (`tools/eval_real.py`,
+with the CPU tuning below); *production* = `com.dachser.ilo.volume_measurement` (`tools/run_production.py`).
 
 | method | FPS (wall) | latency / frame | CPU time / frame | CPU usage (avg cores busy) | CPU usage (% of 20 CPUs) | peak RAM |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Ours, **with** calibration        | 0.55 | 1.83 s | 25.6 CPU·s | 13.9 | 70 % | 1098 MB |
-| Ours, **without** calibration     | 0.54 | 1.85 s | 25.8 CPU·s | 13.9 | 70 % | 1098 MB |
-| Production (`volume_measurement`) | 3.60 | 0.28 s |  2.17 CPU·s |  7.8 | 39 % |  932 MB |
+| Ours, **with** calibration        | 0.75 | 1.33 s |  8.0 CPU·s | 6.0 | 30 % | 1086 MB |
+| Ours, **without** calibration     | 0.75 | 1.34 s |  8.0 CPU·s | 6.0 | 30 % | 1078 MB |
+| Production (`volume_measurement`) | 3.60 | 0.28 s |  2.17 CPU·s | 7.8 | 39 % |  932 MB |
 
+- **CPU tuning (on by default in `eval_real.py`, output unchanged):** `channels_last` memory layout (faster
+  oneDNN conv kernels) + `torch.set_num_threads(6)`. PyTorch defaults to 14 threads here, but spilling onto
+  the E-cores is slower — 6 performance-core threads wins. Together the forward pass is **~1.65x** faster;
+  end-to-end this lifted ours from **0.55 to 0.75 FPS** and cut CPU work from ~14 busy cores / 25.6 CPU·s to
+  **6 cores / 8.0 CPU·s** per frame (≈3.2x less). Override with `--threads N` / `--no_channels_last`. The
+  change only reorders float ops, so sizes move by ≤0.2 cm (below the ~4 cm MAE) and no detection flips.
 - **With vs without calibration cost the same** — identical network forward pass; only the camera
-  intrinsics / geometry differ (negligible compute). The ~0.5 FPS is dominated by 8-fold test-time
-  augmentation (8 forward passes per frame) plus long-edge snapping.
-- **Without TTA**, our single pass runs at **~4.0 FPS, 3.4 CPU·s/frame, ~13.7 cores** (calib) — TTA costs
-  roughly 8x throughput for ~1 pp of extra height accuracy. Drop `--tta` if speed matters more.
-- **Production is ~6.5x faster per frame**: a small rotated-box YOLO on a 416 px ROI vs our 8x full-frame
-  passes, and it averages only ~7.8 busy cores (its OpenCV-DNN Darknet pallet detector and rotated NMS are
-  partly single-threaded). Figures are over the 17 frames whose detector ran (11 produced a measurement);
-  the 2 no-DMC frames are skipped near-instantly.
-- "avg cores busy" = CPU-seconds ÷ wall-seconds; our pipeline saturates all 14 PyTorch threads.
+  intrinsics / geometry differ. The remaining cost is 8-fold test-time augmentation (8 forward passes per
+  frame) + long-edge snapping. **Without `--tta`** a single tuned pass runs at **~6.8 FPS**.
+- **Production** runs a small rotated-box YOLO on a 416 px ROI, so it is ~4.8x faster per frame than our TTA
+  pipeline — but our single tuned pass (~6.8 FPS) is ~1.9x faster than production. Its figures cover the 17
+  frames whose detector ran (11 produced a measurement); the 2 no-DMC frames are skipped near-instantly.
+- "avg cores busy" = CPU-seconds ÷ wall-seconds.
 
 ## Notes / known gaps
 
