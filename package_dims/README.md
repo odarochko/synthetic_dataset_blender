@@ -290,21 +290,22 @@ with the CPU tuning below); *production* = `com.dachser.ilo.volume_measurement` 
 
 | method | FPS (wall) | latency / frame | CPU time / frame | CPU usage (avg cores busy) | CPU usage (% of 20 CPUs) | peak RAM |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Ours, **with** calibration        | 0.75 | 1.33 s |  8.0 CPU·s | 6.0 | 30 % | 1086 MB |
-| Ours, **without** calibration     | 0.75 | 1.34 s |  8.0 CPU·s | 6.0 | 30 % | 1078 MB |
+| Ours, **with** calibration        | 0.80 | 1.24 s |  7.5 CPU·s | 6.0 | 30 % | 1117 MB |
+| Ours, **without** calibration     | 0.81 | 1.23 s |  7.4 CPU·s | 6.0 | 30 % | 1131 MB |
 | Production (`volume_measurement`) | 3.60 | 0.28 s |  2.17 CPU·s | 7.8 | 39 % |  932 MB |
 
-- **CPU tuning (on by default in `eval_real.py`, output unchanged):** `channels_last` memory layout (faster
-  oneDNN conv kernels) + `torch.set_num_threads(6)`. PyTorch defaults to 14 threads here, but spilling onto
-  the E-cores is slower — 6 performance-core threads wins. Together the forward pass is **~1.65x** faster;
-  end-to-end this lifted ours from **0.55 to 0.75 FPS** and cut CPU work from ~14 busy cores / 25.6 CPU·s to
-  **6 cores / 8.0 CPU·s** per frame (≈3.2x less). Override with `--threads N` / `--no_channels_last`. The
-  change only reorders float ops, so sizes move by ≤0.2 cm (below the ~4 cm MAE) and no detection flips.
+- **CPU tuning (on by default in `eval_real.py`, output unchanged):** (1) `channels_last` memory layout
+  (faster oneDNN conv kernels); (2) `torch.set_num_threads(6)` — PyTorch defaults to 14 threads here, but
+  spilling onto the E-cores is slower, so 6 performance-core threads wins; (3) `torch.compile` (graph fusion;
+  all 8 TTA views are 640×640 so it compiles once, on the first frame). Together these took ours from
+  **0.55 → 0.80 FPS** (1.45×) and cut CPU work from ~14 busy cores / 25.6 CPU·s to **6 cores / 7.5 CPU·s**
+  per frame (≈3.4× less). All three only reorder float ops: sizes move ≤0.2 cm (vs the ~4 cm MAE) and no
+  detection flips. Override with `--threads N` / `--no_channels_last` / `--no_compile`.
 - **With vs without calibration cost the same** — identical network forward pass; only the camera
   intrinsics / geometry differ. The remaining cost is 8-fold test-time augmentation (8 forward passes per
-  frame) + long-edge snapping. **Without `--tta`** a single tuned pass runs at **~6.8 FPS**.
-- **Production** runs a small rotated-box YOLO on a 416 px ROI, so it is ~4.8x faster per frame than our TTA
-  pipeline — but our single tuned pass (~6.8 FPS) is ~1.9x faster than production. Its figures cover the 17
+  frame, ~80 % of the time) + long-edge snapping. **Without `--tta`** a single tuned pass runs at **~8 FPS**.
+- **Production** runs a small rotated-box YOLO on a 416 px ROI, so it is ~4.5× faster per frame than our TTA
+  pipeline — but our single tuned pass (~8 FPS) is ~2.2× faster than production. Its figures cover the 17
   frames whose detector ran (11 produced a measurement); the 2 no-DMC frames are skipped near-instantly.
 - "avg cores busy" = CPU-seconds ÷ wall-seconds.
 
