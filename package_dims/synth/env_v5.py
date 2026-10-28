@@ -473,8 +473,65 @@ def make_floor(rng, cam, layout):
             out = np.full((h, w), rng.uniform(140, 230), np.float32) + P.noise(0.4) * 15
         t = t * (1 - m) + out * m
 
+    if layout.get("mats"):
+        t = paint_mats(t, P, layout["mats"], layout["mat_seed"])
     alb = np.clip(t / ALB, 0.0, 1.1).astype(np.float32)
     return alb, rough, {"floor": kind, "paint_share": float((paint > 0.5).mean())}
+
+
+MAT_STYLES = {"rubber": 0.45, "scale": 0.25, "rug": 0.20, "plate": 0.10}
+
+
+def paint_mats(t, P, mats, seed):
+    """Floor mats / floor-scale platforms / rugs / cover plates (never labelled) painted into the floor texture.
+    mats: [(cx, cy, l, w, yaw)] in world metres. Own RNG, so the rest of the floor is the same with or without."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:P.h, 0:P.w].astype(np.float32)
+    c = P.cam
+    X = (((xx + 0.5) / P.ss - 0.5) - c.cx) * c.mount_h / c.fx  # texture pixel -> floor plane (world metres)
+    Y = (((yy + 0.5) / P.ss - 0.5) - c.cy) * c.mount_h / c.fy
+    for cx, cy, l, w, yaw in mats:
+        names = list(MAT_STYLES)
+        style = names[rng.choice(len(names), p=np.array(list(MAT_STYLES.values())))]
+        ca, sa = math.cos(yaw), math.sin(yaw)
+        lx, ly = ca * (X - cx) + sa * (Y - cy), -sa * (X - cx) + ca * (Y - cy)  # mat frame
+        rect = world_rect(cx, cy, l, w, yaw)
+        if rng.random() < 0.45:  # frame / pit edge around it: steel angle or a lighter / darker concrete band
+            fw = rng.uniform(0.03, 0.15)
+            ring = P.mask()
+            P.poly(ring, world_rect(cx, cy, l + 2 * fw, w + 2 * fw, yaw))
+            t = t + ring * rng.choice([-1, 1]) * rng.uniform(10, 45)
+        m = P.mask()
+        P.poly(m, rect)
+        if style == "rubber":       # black / dark grey rubber: bumps, ribs or coin pattern
+            tone = rng.uniform(6, 40)
+            p = rng.uniform(0.015, 0.05)
+            pat = rng.choice(["bumps", "ribs", "plain"], p=[0.45, 0.35, 0.2])
+            tex = np.full_like(t, tone)
+            if pat == "bumps":
+                tex += (np.sin(2 * math.pi * lx / p) * np.sin(2 * math.pi * ly / p) > 0.55) * rng.uniform(4, 14)
+            elif pat == "ribs":
+                tex += (np.sin(2 * math.pi * lx / p) > 0.3) * rng.uniform(4, 12)
+        elif style == "scale":      # floor-scale platform: checker plate with teardrops, sometimes painted
+            tone = rng.uniform(15, 80)
+            p = rng.uniform(0.025, 0.05)
+            tex = np.full_like(t, tone) + (((lx // p + ly // p) % 2) * 2 - 1) * rng.uniform(3, 12)
+        elif style == "rug":        # textile / coir mat: fibrous noise, often with a border band
+            tone = rng.uniform(15, 70)
+            tex = np.full_like(t, tone) + P.noise(0.01) * rng.uniform(5, 15) + P.noise(0.1) * rng.uniform(3, 10)
+        else:                       # steel cover plate
+            tone = rng.uniform(70, 150)
+            tex = np.full_like(t, tone) + P.noise(0.3) * rng.uniform(5, 15)
+        tex += P.noise(rng.uniform(0.2, 1.0)) * rng.uniform(2, 10)   # dirt / wear
+        if rng.random() < 0.5:  # border band inside the edge
+            b = rng.uniform(0.02, 0.12)
+            band = (np.abs(lx) > l / 2 - b) | (np.abs(ly) > w / 2 - b)
+            tex += band * rng.choice([-1, 1]) * rng.uniform(5, 30)
+        t = t * (1 - m) + tex * m
+        edge = P.mask()
+        P.polyline(edge, rect, rng.uniform(0.004, 0.015), closed=True)
+        t += edge * rng.uniform(-40, -10)
+    return t
 
 
 # ---------------------------------------------------------------------------------- structures

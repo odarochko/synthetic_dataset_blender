@@ -53,6 +53,10 @@ from camera import pad_square  # noqa: E402
 from generate import SHARD, rect_corners  # noqa: E402
 
 ALB, EXPOSURE = V3.ALB, V3.EXPOSURE
+V6 = False         # --v6: floor mats / scales / rugs, more cages and overhanging loads (set in main before the pool)
+V6_CAGE_P, V6_OVERHANG_P, V6_MAT_P = 0.10, 0.10, 0.5
+V7 = False         # --v7 (implies --v6): damaged loads, torn film flaps, labels near edges / on cages / damaged
+V7_DAMAGE_P, V7_FLAP_P, V7_EDGE_LABEL_P, V7_LABEL_DAMAGE_P = 0.8, 0.5, 0.5, 0.5
 MAX_LABELLED = 10  # custom_3d_model max_parcels
 MODES = {"isolated": 0.17, "rows": 0.30, "cluster": 0.22, "dock": 0.12, "parcels": 0.09, "empty": 0.10}
 ROUND = {"drums", "cable_drum", "coils", "tyres", "rolls_standing", "rolls_lying", "tubes", "buckets", "ibc"}
@@ -183,10 +187,210 @@ def retone(rng, u):
             p["top_tex"] = np.clip(np.asarray(p["top_tex"], np.float32) * k + add, 0, 255)
 
 
+def cage_unit(rng):
+    """v6: gitterbox cage (v2) or roll container, resized well beyond the pallet sizes (real cages reach ~1.6 m)."""
+    if rng.random() < 0.4:
+        return U.make_unit(rng, kinds=["roll_container"])
+    for _ in range(60):
+        u = V3.v2_unit(rng)
+        if u["kind"] == "cage":
+            scale_unit(u, rng.uniform(0.9, 1.4), rng.uniform(0.9, 1.45), rng.uniform(0.9, 1.3))
+            return u
+    return None
+
+
+def overhang_unit(rng):
+    """v6: pallet load longer than its pallet (panel / board / big box overhanging the pallet ends)."""
+    for _ in range(60):
+        u = V3.v2_unit(rng)
+        if u["pallet"] and u["kind"] != "cage" and u["load"][0] > u["pallet"][0] + 0.08:
+            return u
+    return None
+
+
+# ---------------------------------------------------------------------------------- v7: damaged loads, labels
+def unit_ext(u):
+    """(lo, hi, H) of the package box. v7 fixes it before adding torn film flaps: they are not part of the size."""
+    return u["ext"] if "ext" in u else V3.unit_extent(u)
+
+
+def damage_load(rng, u):
+    """v7: a knocked-about carton load -- cartons missing from the top layer, the upper layer(s) slid sideways and
+    twisted, the whole load leaning. Only loads of plain box parts (v2 cartons); straps are dropped, the film is
+    re-wrapped over the new outline, label spots are recomputed. -> list of what was done."""
+    c = u["carrier_h"]
+    load = [p for p in u["parts"] if not p.get("carrier") and p["P"][:, 2].min() >= c - 1e-6
+            and p.get("mat") != "strap"]
+    if u["kind"] in ROUND or u["kind"] == "cage" or len(load) < 2 or not all(U.is_box(p) for p in load):
+        return []
+    rest = [p for p in u["parts"] if not any(p is q for q in load) and p.get("mat") != "strap"]
+    H = max(p["P"][:, 2].max() for p in load)
+    done = []
+    ops = {k for k, q in (("missing", 0.5), ("shifted", 0.5), ("leaning", 0.4)) if rng.random() < q}
+    ops = ops or {("missing", "shifted", "leaning")[int(rng.integers(3))]}
+    top = [i for i, p in enumerate(load) if p["P"][:, 2].max() > H - 0.03]
+    if len(top) >= 3 and "missing" in ops:
+        drop = set(rng.choice(top, size=int(rng.integers(1, len(top) // 2 + 1)), replace=False).tolist())
+        load = [p for i, p in enumerate(load) if i not in drop]
+        done.append("missing")
+    bottoms = sorted({round(float(p["P"][:, 2].min()), 3) for p in load if p["P"][:, 2].min() > c + 0.05})
+    if bottoms and "shifted" in ops:
+        zc = bottoms[-1] if rng.random() < 0.6 else bottoms[int(rng.integers(len(bottoms)))]
+        a = rng.uniform(0, 2 * math.pi)
+        d = rng.uniform(0.02, 0.09) * np.array([math.cos(a), math.sin(a), 0.0])
+        up = [p for p in load if p["P"][:, 2].min() >= zc - 1e-3]
+        cen = np.concatenate([p["P"] for p in up]).mean(0) * [1, 1, 0]
+        R = U.rotz(rng.normal(0, 0.04))  # twist about the layer centre, then slide
+        U.xform(up, R, cen - cen @ R.T + d)
+        done.append("shifted")
+    if "leaning" in ops:
+        a, k = rng.uniform(0, 2 * math.pi), math.tan(math.radians(rng.uniform(0.8, 3.0)))
+        for p in load:
+            p["P"] = p["P"] + np.c_[k * math.cos(a) * (p["P"][:, 2] - c), k * math.sin(a) * (p["P"][:, 2] - c),
+                                    np.zeros(len(p["P"]))]
+        done.append("leaning")
+    if not done:
+        return []
+    for p in load:  # faces of slid / missing neighbours are now partly in view
+        p["cull"] = False
+    if u["films"]:
+        f0 = u["films"][0]
+        style = {k: f0[k] for k in ("style", "tone", "base", "gain")}
+        z0 = float(min(f["P"][..., 2].min() for f in u["films"]))
+        H2 = max(p["P"][:, 2].max() for p in load)
+        has_top = any(f["kind"] == "top" for f in u["films"])
+        u["films"] = U.film_wrap(rng, U.comps_of(load), z0, H2 if has_top else H2 - rng.uniform(0.0, 0.1),
+                                 has_top, style=style)
+    u["parts"] = rest + load
+    if u["labels"] is not None:
+        u["labels"] = U.top_label_spots(rng, load, max(p["P"][:, 2].max() for p in load))
+    lo, hi = U.extent(load)
+    u["load"] = [float(hi[0] - lo[0]), float(hi[1] - lo[1])]
+    return done
+
+
+def film_flaps(rng, u):
+    """v7: 1-3 torn stretch-film flaps peeling off the side film, hanging / curling outwards from their attachment.
+    Call after fixing u["ext"]: flaps do not count for the size."""
+    sides = [f for f in u["films"] if f["kind"] == "side"]
+    if not sides:
+        return 0
+    f = sides[0]
+    P = f["P"]
+    nl, nc = P.shape[:2]
+    if nl < 3:
+        return 0
+    cen = P.reshape(-1, 3).mean(0)
+    n = 0
+    for _ in range(int(rng.integers(1, 4))):
+        w = int(rng.integers(max(3, nc // 40), max(4, nc // 8)))
+        j0 = int(rng.integers(0, nc - w - 1))
+        ln = int(rng.integers(2, min(6, nl) + 1))
+        i1 = nl - 1 if rng.random() < 0.6 else int(rng.integers(ln - 1, nl))
+        i0 = max(0, i1 - ln + 1)
+        Q = P[i0:i1 + 1, j0:j0 + w + 1].copy()
+        if Q.shape[0] < 2 or Q.shape[1] < 2:
+            continue
+        out = Q[..., :2] - cen[:2]
+        out /= np.maximum(np.linalg.norm(out, axis=-1, keepdims=True), 1e-9)
+        t = np.linspace(1, 0, Q.shape[0])[:, None] if rng.random() < 0.75 else np.linspace(0, 1, Q.shape[0])[:, None]
+        amp = rng.uniform(0.02, 0.10)
+        Q[..., :2] += out * (amp * t ** 1.5)[..., None] + rng.normal(0, 0.004, Q[..., :2].shape)
+        Q[..., 2] -= 0.3 * amp * t ** 2  # sags a little
+        N = U.grid_normals(Q)
+        N *= np.where(((Q[..., :2] - cen[:2]) * N[..., :2]).sum(-1, keepdims=True) < 0, -1, 1)
+        u["films"].append(dict(P=Q, N=N, uv=U.grid_uv(Q), kind="flap",
+                               **{k: f[k] for k in ("style", "tone", "base", "gain")}))
+        n += 1
+    return n
+
+
+def edge_label(rng, u, H):
+    """v7: shipping label near a corner (60 %) or an edge of the top, also on cages (on the top rail, like a tag)
+    -> symbol corners (4, 3) or None. A big label may overhang the edge a little (not part of the size)."""
+    pts = np.concatenate([p["P"] for p in u["parts"] if not p.get("carrier") and p.get("mat") != "strap"]
+                         + [f["P"].reshape(-1, 3) for f in u["films"] if f["kind"] == "top"])
+    top = pts[pts[:, 2] > H - 0.03]
+    if len(top) < 3:
+        return None
+    lo, hi = top[:, :2].min(0), top[:, :2].max(0)
+    ctr, half = (lo + hi) / 2, (hi - lo) / 2
+    s = rng.choice([-1.0, 1.0], 2)
+    tgt = ctr + s * np.maximum(half - rng.uniform(0.10, 0.20, 2), 0.0)  # label centre: stays (mostly) on the top
+    if rng.random() >= 0.6:  # along an edge instead of at a corner
+        k = int(rng.integers(2))
+        tgt[k] = ctr[k] + rng.uniform(-0.6, 0.6) * half[k]
+    x, y = top[np.argmin(np.hypot(top[:, 0] - tgt[0], top[:, 1] - tgt[1])), :2]
+    near = np.hypot(pts[:, 0] - x, pts[:, 1] - y) < 0.09
+    z = float(pts[near, 2].max()) + 0.001
+    fz = U.film_top_z(u["films"], x, y)
+    if fz is not None:
+        z = max(z, fz + 0.002)
+    yaw = rng.integers(4) * math.pi / 2 + rng.normal(0, 0.08) if rng.random() < 0.7 else None
+    part, dmc = U.label_part(rng, float(x), float(y), z, yaw=yaw, max_size=0.16)
+    u["parts"].append(part)
+    return dmc
+
+
+def damage_label(rng, part, dmc):
+    """v7: creased / torn / scuffed / dirty label, sometimes lifted at one side (tilted). -> new symbol corners."""
+    t = np.array(part["top_tex"], np.float32)
+    h, w = t.shape
+    tone = float(np.median(t))
+    if rng.random() < 0.6:  # creases: a thin bright / dark line with a shaded side
+        for _ in range(int(rng.integers(1, 4))):
+            p0, p1 = rng.uniform(0, 1, 2) * (w, h), rng.uniform(0, 1, 2) * (w, h)
+            m = np.zeros_like(t)
+            cv2.line(m, tuple(int(v) for v in p0), tuple(int(v) for v in p1), 1.0, int(rng.integers(1, 4)))
+            t += m * rng.choice([-1, 1]) * rng.uniform(15, 40)
+    if rng.random() < 0.4:  # torn-off corner: the carton shows through
+        cx, cy = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)][int(rng.integers(4))]
+        a, b = rng.uniform(0.1, 0.35) * w, rng.uniform(0.1, 0.35) * h
+        tri = np.array([[cx, cy], [cx + (a if cx == 0 else -a), cy], [cx, cy + (b if cy == 0 else -b)]], np.int32)
+        cv2.fillPoly(t, [tri], rng.uniform(80, 170))
+    if rng.random() < 0.5:  # scuffs / scratches over the symbol
+        for _ in range(int(rng.integers(3, 15))):
+            c = tuple(int(v) for v in rng.uniform(0, 1, 2) * (w, h))
+            cv2.ellipse(t, c, (int(rng.integers(1, 6)), int(rng.integers(1, 4))), rng.uniform(0, 180), 0, 360,
+                        tone if rng.random() < 0.7 else rng.uniform(20, 80), -1)
+    if rng.random() < 0.4:  # dirt smudge
+        yy, xx = np.mgrid[0:h, 0:w]
+        c, r = rng.uniform(0, 1, 2) * (w, h), rng.uniform(0.1, 0.4) * max(w, h)
+        t -= rng.uniform(15, 60) * np.exp(-((xx - c[0]) ** 2 + (yy - c[1]) ** 2) / (2 * r * r))
+    part["top_tex"] = np.clip(t, 0, 255)
+    if rng.random() < 0.3:  # lifted along one side
+        a = rng.uniform(0, 2 * math.pi)
+        R = U.rotz(a) @ U.rotx(math.radians(rng.uniform(3, 12))) @ U.rotz(-a)
+        c = part["P"].mean(0)
+        P2, dmc = (part["P"] - c) @ R.T + c, (dmc - c) @ R.T + c
+        lift = part["P"][:, 2].min() - P2[:, 2].min()
+        part["P"], dmc = P2 + [0, 0, lift], dmc + [0, 0, lift]
+    return dmc
+
+
+def label_v7(rng, u, H):
+    """v7 label: near an edge / corner (50 %, always on cages), else as in v5; stickers damaged half the time."""
+    n0 = len(u["parts"])
+    if u["kind"] == "cage" or rng.random() < V7_EDGE_LABEL_P:
+        dmc = edge_label(rng, u, H)
+    else:
+        dmc = V3.add_label(rng, u, H)
+    if dmc is not None and len(u["parts"]) > n0 and rng.random() < V7_LABEL_DAMAGE_P:
+        dmc = damage_label(rng, u["parts"][-1], np.asarray(dmc, np.float64))
+    return dmc
+
+
 def make_unit(rng, hmax, kind=None):
     """One labelled shipping unit (local frame) no taller than hmax, with size / tone variation."""
     for _ in range(25):
         r = rng.random() if kind is None else {"parcel": 0.95}.get(kind, 0.0)
+        if V6 and kind is None and r < V6_CAGE_P + V6_OVERHANG_P:
+            u = cage_unit(rng) if r < V6_CAGE_P else overhang_unit(rng)
+            if u is not None and V3.unit_extent(u)[2] <= hmax:
+                return u
+            continue
+        if V6 and kind is None:  # the rest keeps the v5 mix
+            r = (r - V6_CAGE_P - V6_OVERHANG_P) / (1 - V6_CAGE_P - V6_OVERHANG_P)
         if r < 0.40:
             u = V3.v2_unit(rng)
         elif r < 0.72:
@@ -204,7 +408,13 @@ def make_unit(rng, hmax, kind=None):
             scale_unit(u, s * rng.uniform(0.92, 1.08), s * rng.uniform(0.92, 1.08), rng.uniform(0.8, 1.25))
         if rng.random() < 0.5:
             retone(rng, u)
-        if V3.unit_extent(u)[2] <= hmax:
+        if V7:
+            u["damage"] = damage_load(rng, u) if rng.random() < V7_DAMAGE_P else []
+            if u["films"] and rng.random() < V7_FLAP_P:
+                u["ext"] = V3.unit_extent(u)
+                if film_flaps(rng, u):
+                    u["damage"].append("film_flaps")
+        if unit_ext(u)[2] <= hmax:
             return u
     return None
 
@@ -215,6 +425,7 @@ class State:
         self.rng, self.cam, self.mask = rng, cam, mask
         self.S = V3.SceneBuf(cam, rng)
         self.taken, self.objects, self.cut = [], [], 0
+        self.placed = []  # labelled units: (cx, cy, yaw, footprint l, w) -- v6 puts floor mats under some
         self.hmax = float(min(2.6, cam.mount_h - 1.3))
         self.ext = E.view_extent(cam)
 
@@ -247,13 +458,16 @@ class State:
 
     def random_point(self, margin=0.0):
         x0, y0, x1, y1 = self.ext
-        return self.rng.uniform(x0 - margin, x1 + margin), self.rng.uniform(y0 - margin, y1 + margin)
+        # an inset (margin < 0) wider than half the view collapses to the centre line instead of failing
+        ax_, bx = (x0 - margin, x1 + margin) if x1 + margin >= x0 - margin else ((x0 + x1) / 2,) * 2
+        ay, by = (y0 - margin, y1 + margin) if y1 + margin >= y0 - margin else ((y0 + y1) / 2,) * 2
+        return self.rng.uniform(ax_, bx), self.rng.uniform(ay, by)
 
     def place_unit(self, u, cx, cy, yaw, gap, truck_p, allow_cut=True):
         """Place u if its footprint (+ pallet truck) is free; labelled when fully visible, unlabelled when cut by the
         image edge with the centre outside. -> True if placed."""
         rng = self.rng
-        lo, hi, H = V3.unit_extent(u)
+        lo, hi, H = unit_ext(u)
         foot_local = rect_corners(*(lo + hi) / 2, *(hi - lo), 0.0)
         foot = G.transform(np.c_[foot_local, np.zeros(4)], yaw, cx, cy)[:, :2]
         truck = None
@@ -275,7 +489,10 @@ class State:
                 return False
         elif len(self.objects) >= MAX_LABELLED:
             return False
-        dmc = V3.add_label(rng, u, H) if (u["kind"] != "cage" and rng.random() < 0.85) else None
+        if V7:
+            dmc = label_v7(rng, u, H) if rng.random() < 0.85 else None
+        else:
+            dmc = V3.add_label(rng, u, H) if (u["kind"] != "cage" and rng.random() < 0.85) else None
         S = self.S
         S.add_parts(u["parts"], yaw, cx, cy)
         if truck:
@@ -288,6 +505,7 @@ class State:
         if not label:
             self.cut += 1
             return True
+        self.placed.append((*G.transform(np.array([[*(lo + hi) / 2, 0.0]]), yaw, cx, cy)[0, :2], yaw, *(hi - lo)))
         cam = self.cam
         bottom, top = V3.w2c(cam, np.c_[foot, np.zeros(4)]), V3.w2c(cam, np.c_[foot, np.full(4, H)])
         pal_top = None
@@ -307,7 +525,7 @@ class State:
                       "label_m": G.LABEL_M, "load_lw_m": u["load"], "load_h_m": H - u["carrier_h"],
                       "pallet_lw_m": u["pallet"], "truck": truck is not None,
                       "film": u["films"][0]["style"] if u["films"] else None,
-                      "soft": any(p.get("soft") for p in u["parts"])},
+                      "soft": any(p.get("soft") for p in u["parts"]), "damage": u.get("damage", [])},
         })
         return True
 
@@ -320,7 +538,8 @@ def layout_rows(st, ax, n_rows=None, v_start=None, truck_p=0.15):
                         [st.ext[0], st.ext[3]]]) @ R  # view in layout coordinates (rows of R^T)
     u0, u1 = corners[:, 0].min() - 1.5, corners[:, 0].max() + 1.5
     vs = np.sort(corners[:, 1])  # inner band of the (rotated) view across the rows
-    v = rng.uniform(vs[1] + 0.05, vs[1] + 0.45 * (vs[2] - vs[1])) if v_start is None else v_start
+    # narrow inner band (< ~11 cm): clamp the range instead of failing (same draw as before for every other scene)
+    v = rng.uniform(vs[1] + 0.05, max(vs[1] + 0.05, vs[1] + 0.45 * (vs[2] - vs[1]))) if v_start is None else v_start
     for _ in range(int(rng.choice([1, 2, 2, 3, 3])) if n_rows is None else n_rows):
         r = rng.random()
         gaps = (0.0, 0.03) if r < 0.35 else (0.05, 0.4) if r < 0.75 else (0.4, 1.2)
@@ -555,6 +774,8 @@ def make_scene(seed, samples):
         place_free(st, parts, l, w, gap=0.05)
     if rng.random() < 0.3:
         st.S.add_parts(V3.floor_clutter(rng), 0.0, 0.0, 0.0)
+    if V6:
+        layout["mats"], layout["mat_seed"] = floor_mats(st, ax), int(rng.integers(2 ** 31))
 
     floor, rough, finfo = E.make_floor(rng, cam, layout)
     style, amb, lights = sample_lights(rng, cam, doors_world)
@@ -567,7 +788,31 @@ def make_scene(seed, samples):
                                        rng.uniform(0.4, 0.6)]))
     meta = {"mode": mode, "light": style, "lens": cam.lens, "mount_h": cam.mount_h, "intrinsics_full": cam.full_intrinsics,
             "cut_units": st.cut, **finfo}
+    if V6:
+        meta["mats"] = len(layout["mats"])
     return scene, st.objects, meta
+
+
+def floor_mats(st, ax):
+    """v6: 0-2 mats / floor scales / rugs; 60 % lie under a labelled unit (as in the real frames), the rest anywhere
+    in view (also in empty scenes, as negatives). -> [(cx, cy, l, w, yaw)]"""
+    rng = st.rng
+    if rng.random() >= V6_MAT_P:
+        return []
+    mats = []
+    for _ in range(1 if rng.random() < 0.75 else 2):
+        if st.placed and rng.random() < 0.6:
+            x, y, yaw, l, w = st.placed[int(rng.integers(len(st.placed)))]
+            l, w = l + rng.uniform(0.2, 1.6), w + rng.uniform(0.2, 1.4)
+            x, y = x + rng.normal(0, 0.25), y + rng.normal(0, 0.25)
+            yaw = yaw + rng.normal(0, 0.15) if rng.random() < 0.5 else ax + rng.normal(0, 0.03)
+        else:
+            x, y = st.random_point(-0.3)
+            l, w = sorted([rng.uniform(0.8, 3.2), rng.uniform(0.6, 2.4)], reverse=True)
+            yaw = ax + rng.choice([0.0, math.pi / 2]) + rng.normal(0, 0.03) if rng.random() < 0.7 else \
+                rng.uniform(0, math.pi)
+        mats.append((float(x), float(y), float(l), float(w), float(yaw)))
+    return mats
 
 
 # ---------------------------------------------------------------------------------- camera / compositing
@@ -629,7 +874,7 @@ def finish_job(i, seed, work, out, canvas, objects, meta):
              "camera_pose": {"height_m": cam.mount_h, "tilt_deg": 0.0, "roll_deg": 0.0},
              "valid_region": [0, 0, cam.size[0], cam.size[1]], "seed": int(seed * 1_000_003 + i),
              "scene": {k: v for k, v in meta.items() if k != "intrinsics_full"},
-             "generator": "synth/generate_v5.py"}
+             "generator": "synth/generate_v5.py" + (" --v7" if V7 else " --v6" if V6 else "")}
     with open(js + ".tmp", "w") as f:
         json.dump(label, f, indent=1)
     os.replace(js + ".tmp", js)
@@ -650,7 +895,19 @@ def main():
     ap.add_argument("--samples", type=int, default=48, help="Cycles samples per pixel (adaptive, denoised)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--keep-work", action="store_true", help="keep the work folder (scenes / raw renders)")
+    ap.add_argument("--v6", action="store_true",
+                    help="v6 scenes: floor mats / scales / rugs (unlabelled), +10 %% cages / roll containers, "
+                         "+10 %% loads overhanging the pallet; default out datasets/SYNTH_V6")
+    ap.add_argument("--v7", action="store_true",
+                    help="v7 scenes (+ all of v6): damaged loads (cartons missing / slid / leaning), torn film flaps, "
+                         "labels near edges / corners / on cages, creased / torn / scuffed / lifted labels; "
+                         "default out datasets/SYNTH_V7")
     args = ap.parse_args()
+    global V6, V7
+    V7 = args.v7
+    V6 = args.v6 or V7
+    if args.out == ap.get_default("out") and (V6 or V7):
+        args.out = os.path.join(ROOT, "datasets", "SYNTH_V7" if V7 else "SYNTH_V6")
 
     todo = [i for i in range(args.start, args.start + args.n) if not all(map(os.path.exists, paths(args.out, i)))]
     print(f"{args.n - len(todo)} done already, {len(todo)} to render", flush=True)
@@ -704,9 +961,11 @@ def main():
                     dt = time.time() - t0
                     print(f"{done}/{len(todo)}  {dt / done:.2f} s/img  eta {dt / done * (len(todo) - done) / 60:.0f} min",
                           flush=True)
-            if not progressed:
+            if not progressed and done < len(todo):  # the last image may have just been finished above
                 codes = [p.poll() for p in procs]
-                if any(c not in (None, 0) for c in codes) or (None not in codes and not finishing):
+                # a renderer may write its last image and exit between the scan above and poll(): rescan before failing
+                late = any(os.path.exists(os.path.join(work, f"{i:08d}.render.png")) for i in built)
+                if any(c not in (None, 0) for c in codes) or (None not in codes and not finishing and not late):
                     raise RuntimeError(f"Blender exited (codes {codes}), see {work}/blender_*.log")
                 time.sleep(0.05)
     finally:

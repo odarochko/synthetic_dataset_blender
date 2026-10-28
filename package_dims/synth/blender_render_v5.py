@@ -73,7 +73,10 @@ class Renderer5(B.Renderer):
         self.floor_me.uv_layers[0].data.foreach_set("uv", np.c_[u, v].astype(np.float32).ravel())
         if self.floor_img is not None:
             bpy.data.images.remove(self.floor_img)
-        self.floor_img = B.image_from_array("floor", s["floor"].astype(np.float32), is_float=True)
+        # grey albedo into R, G and B: a 1-channel array only fills R (G = B = 1), which turned the floor colour into
+        # (a, 1, 1) -- 2/3 of its brightness independent of the painted albedo (renders before this fix)
+        self.floor_img = B.image_from_array("floor", np.repeat(s["floor"].astype(np.float32)[..., None], 3, -1),
+                                            is_float=True)
         self.floor_tex.image = self.floor_img
         self.floor_bsdf.inputs["Roughness"].default_value = float(s["floor_rough"])
 
